@@ -186,6 +186,10 @@ func NewLog(out io.Writer) *Log {
 
 var logobj *Log
 
+func GetLevel() int {
+	return logobj.level
+}
+
 func SetLevel(v int) {
 	logobj.level = v
 }
