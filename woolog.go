@@ -11,12 +11,12 @@ import (
 	"time"
 )
 
-// TODO: FileWriter增加协程设置定时修改文件名，采用指针或者chan方式可避免使用锁
-type FileWriter struct {
+type fileWriter struct {
+	io.Writer
 	FileName string
 }
 
-func (this FileWriter) Write(buff []byte) (int, error) {
+func (this fileWriter) Write(buff []byte) (int, error) {
 	f, e := os.OpenFile(this.FileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, os.FileMode(0766))
 	if e != nil {
 		return 0, e
@@ -48,7 +48,6 @@ const (
 	WARN  int = 3
 	ERROR int = 4
 	FATAL int = 5
-	OFF   int = 6
 )
 
 type Log struct {
@@ -57,11 +56,14 @@ type Log struct {
 	trace     map[uintptr]string
 	traceLock sync.Mutex
 	// time goid info args
-	memch    chan *bytes.Buffer
-	ioch     chan *bytes.Buffer
-	unusech  chan *bytes.Buffer
-	capacity int
-	pid      string
+	memch     chan *bytes.Buffer
+	ioch      chan *bytes.Buffer
+	unusech   chan *bytes.Buffer
+	capacity  int
+	pid       string
+	logname   string
+	logsubfix string
+	logmutex  sync.Mutex
 }
 
 func (this *Log) output(prefix string, pc uintptr, v ...interface{}) {
@@ -135,12 +137,30 @@ func (this *Log) lookupMem() {
 	for {
 		t := time.After(1 * time.Second)
 		<-t
+		this.checkOutputObject()
+
 		w := <-this.memch
 		if w.Len() > 0 {
 			this.memch <- (<-this.unusech)
 			this.ioch <- w
 		} else {
 			this.memch <- w
+		}
+	}
+}
+
+func (this *Log) checkOutputObject() {
+	this.logmutex.Lock()
+	defer this.logmutex.Unlock()
+
+	if len(this.logname) > 0 {
+		subfix := time.Now().Format("20060102")
+		if this.logsubfix != subfix {
+			this.out = fileWriter{FileName: (this.logname + "." + subfix)}
+		}
+	} else {
+		if this.out == nil {
+			this.out = os.Stdout
 		}
 	}
 }
@@ -160,12 +180,36 @@ func (this *Log) lookupIO() {
 	}
 }
 
-func NewLog(out io.Writer) *Log {
-	l := &Log{level: OFF,
-		out:      out,
+func (this *Log) GetLevel() int {
+	return this.level
+}
+
+func (this *Log) SetLevel(lev int) {
+	this.level = lev
+}
+
+func (this *Log) SetLogName(logname string) {
+	this.logmutex.Lock()
+	this.logname = logname
+	this.logsubfix = ""
+	this.logmutex.Unlock()
+	this.checkOutputObject()
+}
+
+func (this *Log) Sync() {
+	for i := 0; i < runtime.NumCPU()+2; i++ {
+		this.ioch <- (<-this.memch)
+		this.memch <- (<-this.unusech)
+	}
+}
+
+func NewLog(logname string) *Log {
+	l := &Log{
+		level:    INFO,
 		capacity: 40000,
 		pid:      strconv.Itoa(os.Getpid()),
 		trace:    make(map[uintptr]string, 100)}
+	l.SetLogName(logname)
 
 	c := runtime.NumCPU() + 2
 	l.memch = make(chan *bytes.Buffer, 1)
@@ -186,16 +230,16 @@ func NewLog(out io.Writer) *Log {
 
 var logobj *Log
 
+func SetLogName(logname string) {
+	logobj.SetLogName(logname)
+}
+
 func GetLevel() int {
-	return logobj.level
+	return logobj.GetLevel()
 }
 
-func SetLevel(v int) {
-	logobj.level = v
-}
-
-func SetOutput(w io.Writer) {
-	logobj.out = w
+func SetLevel(lev int) {
+	logobj.SetLevel(lev)
 }
 
 func Debug(v ...interface{}) {
@@ -239,12 +283,9 @@ func Fatal(v ...interface{}) {
 }
 
 func Sync() {
-	for i := 0; i < runtime.NumCPU()+2; i++ {
-		logobj.ioch <- (<-logobj.memch)
-		logobj.memch <- (<-logobj.unusech)
-	}
+	logobj.Sync()
 }
 
 func init() {
-	logobj = NewLog(os.Stdout)
+	logobj = NewLog("")
 }
