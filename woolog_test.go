@@ -1,9 +1,14 @@
 package woolog
 
 import (
-	"runtime"
+	//"os"
+	//"runtime"
+
 	"testing"
-	"time"
+
+	//"time"
+
+	//	"log"
 )
 
 func parpareData() string {
@@ -21,21 +26,13 @@ func TestLog(t *testing.T) {
 	SetLevel(DEBUG)
 	SetLogName("/tmp/woolog.log")
 
-	context := parpareData()
-	t.Log("cpu:", runtime.NumCPU(), "context:", len(context))
+	//	context := parpareData()
 
-	forever := make(chan int64, runtime.NumCPU())
-	for i := 0; i < runtime.NumCPU(); i++ {
-		go func() {
-			s := time.Now()
-			for i := 0; i < 1000000; i++ {
-				Info(context)
-			}
-			forever <- time.Now().Sub(s).Nanoseconds() / 1000
-		}()
-	}
+	Error("123ddddddddddd14")
+	//log.Println("loglog")
+	t.Log("123")
+	//	log.SetOutput(os.Stdout)
+	//	log.SetFlags(log.Lshortfile)
+	//	log.Println("ppppppp")
 
-	for i := 0; i < runtime.NumCPU(); i++ {
-		t.Log(<-forever)
-	}
 }

@@ -10,7 +10,8 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"time"
-	"woolog"
+
+	woolog "github.com/SteveWarm/gologger"
 )
 
 type BW struct {
@@ -51,22 +52,8 @@ func benchio() {
 
 func benchlog(chioce int) {
 	fmt.Println("chioce:", chioce)
-	var w io.Writer
 
-	if chioce == 1 {
-		f, e := os.OpenFile("benchlog.1.log", os.O_CREATE|os.O_APPEND|os.O_RDWR, os.FileMode(0766))
-		if e != nil {
-			fmt.Println(e.Error())
-			return
-		}
-		defer f.Close()
-		w = f
-	} else if chioce == 2 {
-		f := BW{FileName: "benchlog.2.log"}
-		w = f
-	}
-
-	woolog.SetOutput(w)
+	woolog.SetLogName("/tmp/woo.log")
 	woolog.SetLevel(woolog.DEBUG)
 
 	length := 100
@@ -86,7 +73,7 @@ func benchlog(chioce int) {
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
 			s := time.Now()
-			for i := 0; i < c/runtime.NumCPU(); i++ 
+			for i := 0; i < c/runtime.NumCPU(); i++ {
 				woolog.Info(fmt.Sprintf("sxx:%d uid:%d head%d %d %d %d %d",
 					1000002,
 					10000000,
@@ -104,6 +91,7 @@ func benchlog(chioce int) {
 		fmt.Println("benchlog", <-forever)
 	}
 	time.Sleep(2 * time.Second)
+
 }
 
 func benchStdLog(chioce int) {
@@ -159,7 +147,16 @@ func benchStdLog(chioce int) {
 	time.Sleep(2 * time.Second)
 }
 
+func test1() {
+	woolog.SetLevel(woolog.INFO)
+	woolog.SetLogName("/tmp/woo.log")
+	woolog.Info("hello")
+	time.Sleep(2 * time.Second)
+}
+
 func main() {
+	test1()
+	return
 	f, e := os.Create("profile_file")
 	if e != nil {
 		fmt.Println(e)

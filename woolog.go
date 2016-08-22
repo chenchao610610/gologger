@@ -11,37 +11,6 @@ import (
 	"time"
 )
 
-type fileWriter struct {
-	io.Writer
-	FileName string
-}
-
-func (this fileWriter) Write(buff []byte) (int, error) {
-	f, e := os.OpenFile(this.FileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, os.FileMode(0766))
-	if e != nil {
-		return 0, e
-	}
-	defer f.Close()
-	return f.Write(buff)
-}
-
-func itoa(w *bytes.Buffer, i int, wid int) {
-	// 抄自 /src/log/log.go
-	// Assemble decimal in reverse order.
-	var b [20]byte
-	bp := len(b) - 1
-	for i >= 10 || wid > 1 {
-		wid--
-		q := i / 10
-		b[bp] = byte('0' + i - q*10)
-		bp--
-		i = q
-	}
-	// i < 10
-	b[bp] = byte('0' + i)
-	w.Write(b[bp:])
-}
-
 const (
 	DEBUG int = 1
 	INFO  int = 2
@@ -50,25 +19,84 @@ const (
 	FATAL int = 5
 )
 
+type _stream struct {
+	path string
+	buff bytes.Buffer
+}
+
 type Log struct {
 	level     int
-	out       io.Writer
 	trace     map[uintptr]string
 	traceLock sync.Mutex
-	// time goid info args
-	memch     chan *bytes.Buffer
-	ioch      chan *bytes.Buffer
-	unusech   chan *bytes.Buffer
-	capacity  int
-	pid       string
-	logname   string
-	logsubfix string
-	logmutex  sync.Mutex
+
+	capacity     int
+	lastDay      int
+	pid          string
+	out          io.Writer
+	logPrePath   string
+	logFullPath  string
+	logPathMutex sync.Mutex
+
+	ioCh         chan *_stream
+	bufferCh     chan *_stream
+	bufferChSize int
+}
+
+func (this *Log) GetLevel() int {
+	return this.level
+}
+
+func (this *Log) SetLevel(lev int) {
+	this.level = lev
+}
+
+func (this *Log) SetLogName(prePath string) {
+	this.changeLogPath(prePath)
+}
+
+func (this *Log) Sync() {
+	for i := 0; i < this.bufferChSize; i++ {
+		this.ioCh <- (<-this.bufferCh)
+	}
+}
+
+func NewLog(logname string, capacity, poolsize int) *Log {
+	if capacity <= 0 {
+		panic("illegal capacity")
+	}
+
+	pid := strconv.Itoa(os.Getpid())
+
+	bufferCh := make(chan *_stream, poolsize)
+	ioch := make(chan *_stream, poolsize)
+
+	for i := 0; i < poolsize; i++ {
+		bufferCh <- new(_stream)
+	}
+
+	l := &Log{
+		level:        INFO,
+		capacity:     capacity,
+		pid:          pid,
+		ioCh:         ioch,
+		bufferCh:     bufferCh,
+		bufferChSize: poolsize,
+		trace:        make(map[uintptr]string, 100),
+	}
+
+	l.SetLogName(logname)
+
+	go func() {
+		l.lookupIO()
+	}()
+
+	return l
 }
 
 func (this *Log) output(prefix string, pc uintptr, v ...interface{}) {
-	t := time.Now() // TODO: 时间在什么位置取的问题
+	this.traceLock.Lock()
 	s, ok := this.trace[pc]
+	this.traceLock.Unlock()
 	if !ok {
 		f, l := runtime.FuncForPC(pc).FileLine(pc)
 		// 抄自 /src/log/log.go
@@ -82,18 +110,20 @@ func (this *Log) output(prefix string, pc uintptr, v ...interface{}) {
 				}
 			}
 		}
-		s = fmt.Sprintf("%s:%d", f, l-1)
-		func() {
-			this.traceLock.Lock()
-			defer this.traceLock.Unlock()
-			this.trace[pc] = s
-		}()
+
+		s = fmt.Sprintf("%s:%d", f, l)
+
+		this.traceLock.Lock()
+		this.trace[pc] = s
+		this.traceLock.Unlock()
 	}
 
-	w := <-this.memch // TODO: 先阻塞 当io不足有助于限制内存，防止猛涨
-
+	stream := <-this.bufferCh // TODO: 先阻塞 当io不足有助于限制内存，防止猛涨
+	w := &stream.buff
 	// time format
+	t := time.Now() // TODO: 时间在什么位置取的问题
 	year, month, day := t.Date()
+
 	itoa(w, year, 4)
 	w.WriteByte('/')
 	itoa(w, int(month), 2)
@@ -125,107 +155,85 @@ func (this *Log) output(prefix string, pc uintptr, v ...interface{}) {
 
 	fmt.Fprintln(w, v...)
 
-	if w.Len() < this.capacity {
-		this.memch <- w
-	} else {
-		this.ioch <- w
-		this.memch <- (<-this.unusech)
+	if day != this.lastDay {
+		this.changeLogPath(this.logPrePath)
+		this.lastDay = day
 	}
+
+	stream.path = this.getFullPath()
+	this.ioCh <- stream
 }
 
-func (this *Log) lookupMem() {
-	for {
-		t := time.After(1 * time.Second)
-		<-t
-		this.checkOutputObject()
-
-		w := <-this.memch
-		if w.Len() > 0 {
-			this.memch <- (<-this.unusech)
-			this.ioch <- w
-		} else {
-			this.memch <- w
-		}
-	}
+func (this *Log) getFullPath() string {
+	this.logPathMutex.Lock()
+	defer this.logPathMutex.Unlock()
+	return this.logFullPath
 }
 
-func (this *Log) checkOutputObject() {
-	this.logmutex.Lock()
-	defer this.logmutex.Unlock()
-
-	if len(this.logname) > 0 {
-		subfix := time.Now().Format("20060102")
-		if this.logsubfix != subfix {
-			this.out = fileWriter{FileName: (this.logname + "." + subfix)}
-		}
-	} else {
-		if this.out == nil {
-			this.out = os.Stdout
-		}
-	}
+func (this *Log) changeLogPath(prePath string) {
+	this.logPathMutex.Lock()
+	defer this.logPathMutex.Unlock()
+	subfix := time.Now().Format("20060102")
+	this.logPrePath = prePath
+	this.logFullPath = prePath + "." + subfix
 }
 
 func (this *Log) lookupIO() {
+	lastStream := new(_stream)
+	tick := time.Tick(500 * time.Millisecond)
+
 	for {
 		select {
-		case w := <-this.ioch:
-			if w.Len() > 0 {
-				this.out.Write(w.Bytes())
-				w.Reset()
-				this.unusech <- w
+		case s := <-this.ioCh:
+			if s.path == lastStream.path {
+				if s.buff.Len()+lastStream.buff.Len() > this.capacity {
+					if lastStream.buff.Len() > 0 {
+						writeTpFile(lastStream)
+						lastStream.buff.Reset()
+					}
+
+					if s.buff.Len() > this.capacity {
+						writeTpFile(s)
+					} else {
+						lastStream.buff.Write(s.buff.Bytes())
+					}
+				} else {
+					lastStream.buff.Write(s.buff.Bytes())
+				}
 			} else {
-				this.unusech <- w
+				if lastStream.buff.Len() > 0 {
+					writeTpFile(lastStream)
+					lastStream.buff.Reset()
+				}
+				writeTpFile(s)
+				lastStream.path = s.path
+			}
+			s.buff.Reset()
+			this.bufferCh <- s
+		case <-tick:
+			if lastStream.buff.Len() > 0 {
+				writeTpFile(lastStream)
+				lastStream.buff.Reset()
 			}
 		}
 	}
 }
 
-func (this *Log) GetLevel() int {
-	return this.level
-}
-
-func (this *Log) SetLevel(lev int) {
-	this.level = lev
-}
-
-func (this *Log) SetLogName(logname string) {
-	this.logmutex.Lock()
-	this.logname = logname
-	this.logsubfix = ""
-	this.logmutex.Unlock()
-	this.checkOutputObject()
-}
-
-func (this *Log) Sync() {
-	for i := 0; i < runtime.NumCPU()+2; i++ {
-		this.ioch <- (<-this.memch)
-		this.memch <- (<-this.unusech)
+func writeTpFile(s *_stream) {
+	if s.buff.Len() > 0 {
+		defer func() {
+			err := recover()
+			if err != nil {
+				fmt.Fprintln(os.Stderr, err)
+			}
+		}()
+		f, e := os.OpenFile(s.path, os.O_CREATE|os.O_APPEND|os.O_RDWR, os.FileMode(0766))
+		if e != nil {
+			return
+		}
+		defer f.Close()
+		f.Write(s.buff.Bytes())
 	}
-}
-
-func NewLog(logname string) *Log {
-	l := &Log{
-		level:    INFO,
-		capacity: 40000,
-		pid:      strconv.Itoa(os.Getpid()),
-		trace:    make(map[uintptr]string, 100)}
-	l.SetLogName(logname)
-
-	c := runtime.NumCPU() + 2
-	l.memch = make(chan *bytes.Buffer, 1)
-	l.ioch = make(chan *bytes.Buffer, c)
-	l.unusech = make(chan *bytes.Buffer, c)
-
-	for i := 0; i < c; i++ {
-		w := new(bytes.Buffer)
-		w.Grow(l.capacity + 960)
-		l.unusech <- w
-	}
-	l.memch <- (<-l.unusech)
-
-	go l.lookupIO()
-	go l.lookupMem()
-	return l
 }
 
 var logobj *Log
@@ -243,7 +251,7 @@ func SetLevel(lev int) {
 }
 
 func Debug(v ...interface{}) {
-	if logobj.level <= DEBUG && logobj.out != nil {
+	if logobj.level <= DEBUG {
 		pc := make([]uintptr, 1)
 		runtime.Callers(2, pc) // 层次越深 性能越差
 		logobj.output("DEBUG", pc[0], v...)
@@ -251,7 +259,7 @@ func Debug(v ...interface{}) {
 }
 
 func Info(v ...interface{}) {
-	if logobj.level <= INFO && logobj.out != nil {
+	if logobj.level <= INFO {
 		pc := make([]uintptr, 1)
 		runtime.Callers(2, pc)
 		logobj.output("INFO", pc[0], v...)
@@ -259,7 +267,7 @@ func Info(v ...interface{}) {
 }
 
 func Warn(v ...interface{}) {
-	if logobj.level <= WARN && logobj.out != nil {
+	if logobj.level <= WARN {
 		pc := make([]uintptr, 1)
 		runtime.Callers(2, pc)
 		logobj.output("WARN", pc[0], v...)
@@ -267,7 +275,7 @@ func Warn(v ...interface{}) {
 }
 
 func Error(v ...interface{}) {
-	if logobj.level <= FATAL && logobj.out != nil {
+	if logobj.level <= FATAL {
 		pc := make([]uintptr, 1)
 		runtime.Callers(2, pc)
 		logobj.output("FATAL", pc[0], v...)
@@ -275,7 +283,7 @@ func Error(v ...interface{}) {
 }
 
 func Fatal(v ...interface{}) {
-	if logobj.level <= FATAL && logobj.out != nil {
+	if logobj.level <= FATAL {
 		pc := make([]uintptr, 1)
 		runtime.Callers(2, pc)
 		logobj.output("FATAL", pc[0], v...)
@@ -286,6 +294,37 @@ func Sync() {
 	logobj.Sync()
 }
 
+//type fileWriter struct {
+//	io.Writer
+//	FileName string
+//}
+
+//func (this fileWriter) Write(buff []byte) (int, error) {
+//	f, e := os.OpenFile(this.FileName, os.O_CREATE|os.O_APPEND|os.O_RDWR, os.FileMode(0766))
+//	if e != nil {
+//		return 0, e
+//	}
+//	defer f.Close()
+//	return f.Write(buff)
+//}
+
+func itoa(w *bytes.Buffer, i int, wid int) {
+	// 抄自 /src/log/log.go
+	// Assemble decimal in reverse order.
+	var b [20]byte
+	bp := len(b) - 1
+	for i >= 10 || wid > 1 {
+		wid--
+		q := i / 10
+		b[bp] = byte('0' + i - q*10)
+		bp--
+		i = q
+	}
+	// i < 10
+	b[bp] = byte('0' + i)
+	w.Write(b[bp:])
+}
+
 func init() {
-	logobj = NewLog("")
+	logobj = NewLog("", 4096, 4)
 }
